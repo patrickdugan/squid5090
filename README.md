@@ -4,6 +4,8 @@
 
 ![squid5090 RTX 5090 Benchmark & 1M Context Scaling](assets/benchmark.png)
 
+> **Running on a 16 GiB RTX 5080?** See **[`PORT-5080.md`](PORT-5080.md)** (CUDA 12.8+ builds, WSL2, VRAM auto-fit).
+
 > **Want to understand how it works?**
 > - **[`LITE.md`](LITE.md)** — Plain-English, 3Blue1Brown-style visual guide to every optimization and how runtime-gated abliteration works step by step.
 > - **[`LEARNINGS.md`](LEARNINGS.md)** — Complete technical reference: every Blackwell kernel optimization, roofline audit vs. [`sybil-solutions/inference-optimisation-skill`](https://github.com/sybil-solutions/inference-optimisation-skill) (including what's still left on the table), and the `uv` abliteration pipeline.
