@@ -175,6 +175,13 @@ pub const Engine = struct {
     h_chosen_width: ?*i32 = null,
     h_lookup_drafts: ?[*]i32 = null,
 
+    // SQUID_EXPERT_TRACE=<path>: MoE routing trace in zero-copy host RAM, written at deinit.
+    expert_trace_host: ?*anyopaque = null,
+    expert_trace_dev: ?*anyopaque = null,
+    expert_trace_count: ?*i32 = null,
+    expert_trace_cap: i32 = 0,
+    expert_trace_req: i32 = 0,
+
     // Multi-checkpoint host-RAM prefix KV cache (zero extra VRAM!)
     prefix_cache: PrefixCache = .{},
     prompt_lookup: PromptLookupIndex = .{},
@@ -382,6 +389,23 @@ pub const Engine = struct {
         tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_ld_raw, constants.mtp_draft_count_max * @sizeOf(i32), 0));
         self.h_lookup_drafts = @ptrCast(@alignCast(h_ld_raw.?));
 
+        if (tiger.getenv("SQUID_EXPERT_TRACE") != null) {
+            const trace_cap: usize = 8 * 1024 * 1024; // 16-byte records: 128 MiB of pinned host RAM
+            var h_tr: ?*anyopaque = null;
+            tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_tr, trace_cap * 16, 1));
+            var d_tr: ?*anyopaque = null;
+            tiger.assert_cuda(cuda.squid_cuda_host_get_device_pointer(&d_tr, h_tr.?));
+            var d_cnt: ?*anyopaque = null;
+            tiger.assert_cuda(cuda.squid_cuda_malloc(&d_cnt, 2 * @sizeOf(i32)));
+            const zeros = [2]i32{ 0, 0 }; // [0] = records appended, [1] = current request index
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(d_cnt.?, @ptrCast(&zeros), 2 * @sizeOf(i32)));
+            self.expert_trace_host = h_tr;
+            self.expert_trace_dev = d_tr;
+            self.expert_trace_count = @ptrCast(@alignCast(d_cnt.?));
+            self.expert_trace_cap = @intCast(trace_cap);
+            tiger.print_stdout("[expert-trace] on: up to {d} records in pinned host RAM\n", .{trace_cap});
+        }
+
         self.hidden = self.arena.alloc_many(f32, b_max * constants.hidden_dim);
         self.prelude = self.arena.alloc_many(f32, b_max * constants.hidden_dim);
         self.partial = self.arena.alloc_many(f32, b_max * constants.hidden_dim);
@@ -484,6 +508,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine) void {
+        self.dump_expert_trace();
         if (self.b1_graph_exec) |g| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(g));
         for (&self.spec_graph_exec) |*g| {
             if (g.*) |exec| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(exec));
@@ -500,6 +525,8 @@ pub const Engine = struct {
         if (self.h_num_accepted) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(@ptrCast(p)));
         if (self.h_chosen_width) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(@ptrCast(p)));
         if (self.h_lookup_drafts) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(@ptrCast(p)));
+        if (self.expert_trace_host) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(p));
+        if (self.expert_trace_count) |p| tiger.assert_cuda(cuda.squid_cuda_free(@ptrCast(p)));
         self.deinit_prefix_cache();
         self.arena.deinit();
         if (self.done_event) |e| tiger.assert_cuda(cuda.squid_cuda_event_destroy(e));
@@ -529,6 +556,34 @@ pub const Engine = struct {
 
     /// Allocate static host-RAM prefix KV cache (zero extra VRAM, zero malloc per request).
     /// Stores 4 local-state+ring checkpoints (~193 MiB each) + a 4K-token global-KV side-request shield.
+    fn trace_experts(self: *Engine, route_ids: [*]const i32, batch: i32, visit: u32, phase: i32) void {
+        const cnt = self.expert_trace_count orelse return;
+        cuda.squid_launch_expert_trace(route_ids, batch, @intCast(visit), phase, cnt, self.expert_trace_dev.?, self.expert_trace_cap, self.stream);
+    }
+
+    fn dump_expert_trace(self: *Engine) void {
+        const cnt = self.expert_trace_count orelse return;
+        const path = tiger.getenv("SQUID_EXPERT_TRACE") orelse return;
+        tiger.assert_cuda(cuda.squid_cuda_device_sync());
+        var total: i32 = 0;
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(&total), @ptrCast(cnt), @sizeOf(i32)));
+        const kept: usize = @intCast(@min(total, self.expert_trace_cap));
+        const fd = tiger.open(path, 0o1 | 0o100 | 0o1000, @as(c_uint, 0o644));
+        if (fd < 0) {
+            tiger.print_stdout("[expert-trace] cannot open {s}\n", .{path});
+            return;
+        }
+        defer _ = tiger.close(fd);
+        const bytes = @as([*]const u8, @ptrCast(self.expert_trace_host.?))[0 .. kept * 16];
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = tiger.write(fd, bytes[off..].ptr, bytes.len - off);
+            if (n <= 0) break;
+            off += @intCast(n);
+        }
+        tiger.print_stdout("[expert-trace] wrote {d} of {d} records ({d} bytes) to {s}\n", .{ kept, total, off, path });
+    }
+
     pub fn enable_prefix_cache(self: *Engine) void {
         tiger.assert(self.weights != null);
         if (self.prefix_cache.enabled) return;
@@ -796,6 +851,12 @@ pub const Engine = struct {
         var stats: GenerateStats = .{ .prompt_tokens = @intCast(prompt.len) };
         if (prompt.len == 0 or max_new_tokens_in == 0) return stats;
         if (prompt.len >= self.context_tokens_max) return stats;
+        if (self.expert_trace_count) |cnt| {
+            // Graph-captured trace launches read the request index from device memory.
+            self.expert_trace_req += 1;
+            const req_ptr: *i32 = @ptrFromInt(@intFromPtr(cnt) + @sizeOf(i32));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(req_ptr), @ptrCast(&self.expert_trace_req), @sizeOf(i32)));
+        }
 
         var max_new_tokens: u32 = max_new_tokens_in;
         const room: u32 = self.context_tokens_max - @as(u32, @intCast(prompt.len));
@@ -1646,6 +1707,7 @@ pub const Engine = struct {
                 b_i32,
                 self.stream,
             );
+            self.trace_experts(self.p_route_ids, b_i32, vi, 1);
             cuda.squid_launch_prefill_moe_gate_up_h(
                 &lw.w13,
                 self.p_mlp_normed_h,
@@ -2259,6 +2321,7 @@ pub const Engine = struct {
                     self.stream,
                 );
             }
+            self.trace_experts(self.route_ids, batch_size, vi, 0);
             cuda.squid_launch_moe_gate_up_h(&lw.w13, self.mlp_normed_h, self.route_ids, self.exp_groups, self.moe_act_h, batch_size, self.stream);
             cuda.squid_launch_moe_down_h(&lw.w2, self.moe_act_h, self.route_ids, self.route_w, self.exp_groups, self.moe_down, batch_size, self.stream);
 

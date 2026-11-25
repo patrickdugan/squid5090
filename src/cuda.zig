@@ -79,6 +79,7 @@ pub const CDsparkWeights = extern struct {
 // --- CUDA Runtime Primitives ---
 
 pub extern "c" fn squid_cuda_malloc(ptr: *?*anyopaque, bytes: usize) i32;
+pub extern "c" fn squid_launch_expert_trace(route_ids: [*]const i32, B: i32, visit: i32, phase: i32, d_count: *i32, host_dev_ptr: *anyopaque, cap: i32, stream: ?*anyopaque) void;
 pub extern "c" fn squid_cuda_free(ptr: ?*anyopaque) i32;
 pub extern "c" fn squid_cuda_mem_get_info(free_bytes: *usize, total_bytes: *usize) i32;
 pub extern "c" fn squid_cuda_malloc_host_pinned(ptr: *?*anyopaque, bytes: usize, mapped: u8) i32;
